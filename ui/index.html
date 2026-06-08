@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fuzzy Logic Studio</title>
+
+    <!-- Tailwind CSS -->
+    <script src="vendor/tailwindcss.js"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    },
+                    colors: {
+                        puc: {
+                            red: '#8C3A22',
+                            stone: '#F4F5F0',
+                            gray: '#666666',
+                        },
+                        zinc: {
+                            850: '#27272a',
+                            950: '#09090b',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <!-- Google Fonts: Inter -->
+    <link href="vendor/inter.css" rel="stylesheet">
+
+    <!-- React & ReactDOM -->
+    <script crossorigin src="vendor/react.development.js"></script>
+    <script crossorigin src="vendor/react-dom.development.js"></script>
+
+    <!-- Babel for JSX -->
+    <script src="vendor/babel.min.js"></script>
+
+    <!-- Prop Types (Required by Recharts UMD) -->
+    <script src="vendor/prop-types.min.js"></script>
+
+    <!-- Recharts (Pinned Version) -->
+    <!-- Note: Recharts UMD build can be finicky. Using a specific version known to work with React 18 UMD. -->
+    <script src="vendor/Recharts.js"></script>
+
+
+    <style>
+        body {
+            background-color: #F4F5F0;
+            color: #1a1a1a;
+        }
+
+        .glass {
+            background: rgba(255, 255, 255, 0.7);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(140, 58, 34, 0.1);
+        }
+    </style>
+</head>
+
+<body>
+    <div id="root"></div>
+
+    <!-- Main App -->
+    <script type="text/babel" src="app.jsx"></script>
+</body>
+
+</html>
