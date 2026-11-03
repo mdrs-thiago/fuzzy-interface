@@ -12,3 +12,6 @@ env/
 
 # Temp dev files
 temp_pkg/
+
+# Node (UI build tooling)
+node_modules/

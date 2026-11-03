@@ -91,28 +91,24 @@ class WangMendelExtractor:
             self.rules.append(best_rule)
 
     def export_config(self, target_col):
+        """Exports in the format accepted by the API's /import endpoint."""
         config = {
             "variables": {},
             "rules": []
         }
         for var_name, var_data in self.variables.items():
-            role = "output" if var_name == target_col else "input"
-            terms_config = {}
-            for t_name, t_data in var_data["terms"].items():
-                terms_config[t_name] = {
-                    "type": "triangular",
-                    "params": t_data["params"]
-                }
             config["variables"][var_name] = {
-                "role": role,
-                "min_val": var_data["min"],
-                "max_val": var_data["max"],
-                "terms": terms_config
+                "role": "output" if var_name == target_col else "input",
+                "min": var_data["min"],
+                "max": var_data["max"],
+                "terms": [
+                    {"name": t_name, "type": "tri", "params": [float(p) for p in t_data["params"]]}
+                    for t_name, t_data in var_data["terms"].items()
+                ]
             }
         for rule in self.rules:
             config["rules"].append({
                 "antecedents": rule["antecedents"],
-                "consequent": rule["consequent"],
-                "weight": 1.0
+                "consequent": rule["consequent"]
             })
         return config

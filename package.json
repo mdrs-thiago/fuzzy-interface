@@ -1,0 +1,14 @@
+{
+  "name": "fuzzy-studio-ui",
+  "private": true,
+  "description": "Build step for the UI. Only needed after editing ui/app.jsx; the built files are committed.",
+  "scripts": {
+    "build": "npm run build:js && npm run build:css",
+    "build:js": "esbuild ui/app.jsx --loader:.jsx=jsx --jsx-factory=React.createElement --jsx-fragment=React.Fragment --target=es2020 --minify --outfile=ui/app.js",
+    "build:css": "tailwindcss -c tailwind.config.js -i ui/styles.css -o ui/app.css --minify"
+  },
+  "devDependencies": {
+    "esbuild": "0.24.0",
+    "tailwindcss": "3.4.14"
+  }
+}

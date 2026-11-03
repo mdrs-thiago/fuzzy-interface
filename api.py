@@ -1,654 +1,671 @@
+import base64
+import binascii
+import io
+import math
+import os
+import secrets
+import time
+from typing import Annotated, Any, Dict, List, Optional, Tuple
+
+import pandas as pd
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from typing import List, Dict, Union, Optional, Any
-import base64
-import io
-import pandas as pd
+from pydantic import AfterValidator, BaseModel, Field
+
 from fuzzy_torch import FuzzyModule, FuzzyVariable, FuzzyRule, TriangularMF, TrapezoidalMF, GaussianMF, BellMF, SigmoidMF
 from fuzzy_torch.defuzz import Centroid
 from eautomfis.wang_mendel import WangMendelExtractor
 
+# --- Settings (environment) ---
+# Comma-separated origins allowed to call the API from another site. The bundled UI is
+# served from the same origin, so CORS is off unless this is set.
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("FIS_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+SESSION_TTL = int(os.environ.get("FIS_SESSION_TTL", 4 * 3600))  # seconds of inactivity
+MAX_SESSIONS = int(os.environ.get("FIS_MAX_SESSIONS", 1000))
+MAX_CSV_BYTES = int(os.environ.get("FIS_MAX_CSV_BYTES", 5 * 1024 * 1024))
+SESSION_COOKIE = "fis_session"
+
 app = FastAPI(title="Fuzzy Inference System API")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
-# --- Global State (Builder Pattern) ---
+# --- Membership functions ---
+# short name -> (class, parameter attribute names)
+MF_SPECS = {
+    "tri": (TriangularMF, ["a", "b", "c"]),
+    "trap": (TrapezoidalMF, ["a", "b", "c", "d"]),
+    "gauss": (GaussianMF, ["mu", "sigma"]),
+    "bell": (BellMF, ["a", "b", "c"]),
+    "sig": (SigmoidMF, ["b", "c"]),
+}
+MF_ALIASES = {
+    "tri": "tri", "triangular": "tri", "triangularmf": "tri", "trimf": "tri",
+    "trap": "trap", "trapezoidal": "trap", "trapezoidalmf": "trap", "trapmf": "trap",
+    "gauss": "gauss", "gaussian": "gauss", "gaussianmf": "gauss", "gaussmf": "gauss",
+    "bell": "bell", "bellmf": "bell", "gbellmf": "bell",
+    "sig": "sig", "sigmoid": "sig", "sigmoidmf": "sig", "sigmf": "sig",
+}
+
+
+def mf_kind(type_name: str) -> str:
+    kind = MF_ALIASES.get(str(type_name).strip().lower())
+    if kind is None:
+        raise ValueError(f"Unknown membership function type '{type_name}'")
+    return kind
+
+
+def make_mf(type_name: str, params: List[float]):
+    """Validates parameters and builds a membership function."""
+    kind = mf_kind(type_name)
+    cls, names = MF_SPECS[kind]
+    if len(params) != len(names):
+        raise ValueError(f"{cls.__name__} needs {len(names)} parameters ({', '.join(names)}), got {len(params)}")
+    p = [float(v) for v in params]
+    if not all(math.isfinite(v) for v in p):
+        raise ValueError("Parameters must be finite numbers")
+    if kind in ("tri", "trap") and p != sorted(p):
+        raise ValueError(f"{cls.__name__} parameters must be in ascending order ({' <= '.join(names)})")
+    if kind == "gauss" and p[1] <= 0:
+        raise ValueError("Gaussian sigma must be greater than 0")
+    if kind == "bell" and (p[0] == 0 or p[1] <= 0):
+        raise ValueError("Bell 'a' must be non-zero and 'b' greater than 0")
+    return cls(*p)
+
+
+def mf_to_dict(mf) -> Dict[str, Any]:
+    for cls, names in MF_SPECS.values():
+        if type(mf) is cls:
+            return {"type": cls.__name__, "params": [getattr(mf, n).item() for n in names]}
+    raise ValueError(f"Unsupported membership function {type(mf).__name__}")
+
+
+def check_name(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError("Name must not be empty")
+    if "/" in value:
+        raise ValueError("Name must not contain '/'")
+    if len(value) > 64:
+        raise ValueError("Name must be at most 64 characters")
+    return value
+
+
+def http_400(e: Exception):
+    msg = e.args[0] if isinstance(e, KeyError) and e.args else str(e)
+    return HTTPException(status_code=400, detail=msg)
+
+
+# --- Per-session state (Builder Pattern) ---
 class FuzzyBuilder:
     def __init__(self):
         self.variables: Dict[str, FuzzyVariable] = {}
-        self.roles: Dict[str, str] = {} # var_name -> 'input' | 'output'
-        self.rules_data: List[Dict] = [] # Store raw rule config for reconstruction
-        self.system: Optional[FuzzyModule] = None
-        self.dirty = False # Flag to rebuild system
+        self.roles: Dict[str, str] = {}  # var_name -> 'input' | 'output'
+        self.rules_data: List[Dict] = []  # raw rule config, in system rule order
+        self._system: Optional[FuzzyModule] = None
 
-    def get_variable(self, name: str):
+    def invalidate(self):
+        """Call after any change; the system is rebuilt on next use."""
+        self._system = None
+
+    def reset(self):
+        self.variables, self.roles, self.rules_data = {}, {}, []
+        self.invalidate()
+
+    def get_variable(self, name: str) -> FuzzyVariable:
         if name not in self.variables:
             raise HTTPException(status_code=404, detail=f"Variable '{name}' not found")
         return self.variables[name]
 
-    def delete_variable(self, name: str):
+    def add_variable(self, name: str, min_val: float, max_val: float, role: str):
+        name = check_name(name)
+        if role not in ("input", "output"):
+            raise ValueError("Role must be 'input' or 'output'")
+        if not (math.isfinite(min_val) and math.isfinite(max_val)) or min_val >= max_val:
+            raise ValueError(f"Variable '{name}': min must be smaller than max")
         if name in self.variables:
-            del self.variables[name]
-        if name in self.roles:
-            del self.roles[name]
+            # Redefining a variable keeps its terms but changes range/role
+            old = self.variables[name]
+            var = FuzzyVariable(name, min_val, max_val)
+            for t_name, mf in old.terms.items():
+                var.add_term(t_name, mf)
+            if role != self.roles.get(name):
+                self.rules_data = [r for r in self.rules_data if name not in r["antecedents"] and name not in r["consequent"]]
+        else:
+            var = FuzzyVariable(name, min_val, max_val)
+        self.variables[name] = var
+        self.roles[name] = role
+        self.invalidate()
+
+    def add_term(self, var_name: str, term_name: str, type_name: str, params: List[float]):
+        var = self.get_variable(var_name)
+        var.add_term(check_name(term_name), make_mf(type_name, params))
+        self.invalidate()
+
+    def add_rule(self, antecedents: Dict[str, str], consequent: Dict[str, str]):
+        if not antecedents:
+            raise ValueError("A rule needs at least one antecedent (IF part)")
+        if len(consequent) != 1:
+            raise ValueError("A rule needs exactly one consequent (THEN part)")
+        for v, t in antecedents.items():
+            if v not in self.variables or t not in self.variables[v].terms:
+                raise ValueError(f"Invalid antecedent {v} IS {t}")
+            if self.roles.get(v) != "input":
+                raise ValueError(f"Antecedent '{v}' is not an input variable")
+        (c_var, c_term), = consequent.items()
+        if c_var not in self.variables or c_term not in self.variables[c_var].terms:
+            raise ValueError(f"Invalid consequent {c_var} IS {c_term}")
+        if self.roles.get(c_var) != "output":
+            raise ValueError(f"Consequent '{c_var}' is not an output variable")
+        self.rules_data.append({"antecedents": dict(antecedents), "consequent": dict(consequent)})
+        self.invalidate()
+
+    def delete_variable(self, name: str):
+        self.get_variable(name)
+        del self.variables[name]
+        self.roles.pop(name, None)
         # Remove rules referencing this variable
         self.rules_data = [
-            r for r in self.rules_data 
+            r for r in self.rules_data
             if name not in r['antecedents'] and name not in r['consequent']
         ]
-        self.system = None
+        self.invalidate()
 
     def delete_term(self, var_name: str, term_name: str):
         var = self.get_variable(var_name)
-        if term_name in var.terms:
-            del var.terms[term_name]
+        if term_name not in var.terms:
+            raise HTTPException(status_code=404, detail=f"Term '{term_name}' not found in '{var_name}'")
+        del var.terms[term_name]
         # Remove rules referencing this term
         self.rules_data = [
-            r for r in self.rules_data 
+            r for r in self.rules_data
             if r['antecedents'].get(var_name) != term_name and r['consequent'].get(var_name) != term_name
         ]
-        self.system = None
+        self.invalidate()
 
     def delete_rule(self, index: int):
-        if 0 <= index < len(self.rules_data):
-            self.rules_data.pop(index)
-        self.system = None
+        if not 0 <= index < len(self.rules_data):
+            raise HTTPException(status_code=404, detail=f"Rule {index} not found")
+        self.rules_data.pop(index)
+        self.invalidate()
 
-builder = FuzzyBuilder()
+    def load_config(self, config: Dict[str, Any]):
+        """Replaces the state with `config`. On error the current state is left untouched.
+
+        Accepts the /export format as well as older/alternative spellings
+        (min_val/max_val, terms as a dict, 'triangular' type names).
+        """
+        if not isinstance(config, dict):
+            raise ValueError("Config must be a JSON object")
+        staged = FuzzyBuilder()
+        variables = config.get("variables", {})
+        if not isinstance(variables, dict):
+            raise ValueError("'variables' must be an object")
+        for name, data in variables.items():
+            lo, hi = data.get("min", data.get("min_val")), data.get("max", data.get("max_val"))
+            if lo is None or hi is None:
+                raise ValueError(f"Variable '{name}' is missing min/max")
+            staged.add_variable(name, float(lo), float(hi), data.get("role", "input"))
+            terms = data.get("terms", [])
+            if isinstance(terms, dict):
+                terms = [{"name": k, **v} for k, v in terms.items()]
+            for term in terms:
+                try:
+                    staged.add_term(name, term["name"], term["type"], term["params"])
+                except (KeyError, TypeError) as e:
+                    raise ValueError(f"Variable '{name}': malformed term {term!r}") from e
+                except ValueError as e:
+                    raise ValueError(f"Variable '{name}', term '{term.get('name')}': {e}") from e
+        for i, rule in enumerate(config.get("rules", [])):
+            try:
+                staged.add_rule(rule.get("antecedents", {}), rule.get("consequent", {}))
+            except (AttributeError, ValueError) as e:
+                raise ValueError(f"Rule {i}: {e}") from e
+        self.variables, self.roles, self.rules_data = staged.variables, staged.roles, staged.rules_data
+        self.invalidate()
+
+    def export_config(self, terms_as_dict: bool = False) -> Dict[str, Any]:
+        vars_out = {}
+        for name, var in self.variables.items():
+            if terms_as_dict:
+                terms = {t: mf_to_dict(mf) for t, mf in var.terms.items()}
+            else:
+                terms = [{"name": t, **mf_to_dict(mf)} for t, mf in var.terms.items()]
+            vars_out[name] = {"min": var.range_min, "max": var.range_max, "role": self.roles.get(name, "input"), "terms": terms}
+        return {"variables": vars_out, "rules": self.rules_data}
+
+    def output_name(self) -> str:
+        outputs = [n for n, r in self.roles.items() if r == "output"]
+        if not outputs:
+            raise ValueError("No output variable defined. Create an output variable in the Editor tab.")
+        if len(outputs) > 1:
+            raise ValueError(f"Only one output variable is supported, found {len(outputs)}: {', '.join(outputs)}")
+        return outputs[0]
+
+    def required_inputs(self) -> List[str]:
+        names = []
+        for r in self.rules_data:
+            for v in r["antecedents"]:
+                if v not in names:
+                    names.append(v)
+        return names
+
+    def system(self) -> FuzzyModule:
+        """Returns the built system, (re)building it if the configuration changed."""
+        if self._system is not None:
+            return self._system
+        try:
+            out_name = self.output_name()
+            output = self.variables[out_name]
+            if not output.terms:
+                raise ValueError(f"Output variable '{out_name}' has no fuzzy sets yet.")
+            if not self.rules_data:
+                raise ValueError("No rules defined yet. Add at least one rule in the Rules tab.")
+            rules = []
+            for r in self.rules_data:
+                (c_name, c_term), = r["consequent"].items()
+                antecedents = [(self.variables[v], t) for v, t in r["antecedents"].items()]
+                rules.append(FuzzyRule(antecedent=antecedents, consequent=(self.variables[c_name], c_term)))
+            inputs = [v for k, v in self.variables.items() if self.roles.get(k) == "input"]
+            self._system = FuzzyModule(inputs=inputs, output=output, rules=rules,
+                                       defuzz_method=Centroid(output.range_min, output.range_max))
+        except (ValueError, KeyError) as e:
+            raise http_400(e)
+        return self._system
+
+
+class SessionStore:
+    """In-memory builders keyed by a browser cookie, so visitors don't share a system."""
+
+    def __init__(self):
+        self._sessions: Dict[str, List] = {}  # sid -> [builder, last_seen]
+
+    def get(self, sid: Optional[str]) -> Tuple[str, FuzzyBuilder]:
+        now = time.monotonic()
+        entry = self._sessions.get(sid) if sid else None
+        if entry is None:
+            self._evict(now)
+            if not sid or len(sid) > 64:
+                sid = secrets.token_urlsafe(24)
+            entry = self._sessions[sid] = [FuzzyBuilder(), now]
+        entry[1] = now
+        return sid, entry[0]
+
+    def _evict(self, now: float):
+        for sid in [s for s, (_, seen) in self._sessions.items() if now - seen > SESSION_TTL]:
+            del self._sessions[sid]
+        while len(self._sessions) >= MAX_SESSIONS:
+            oldest = min(self._sessions, key=lambda s: self._sessions[s][1])
+            del self._sessions[oldest]
+
+
+sessions = SessionStore()
+
+
+@app.middleware("http")
+async def session_middleware(request: Request, call_next):
+    cookie = request.cookies.get(SESSION_COOKIE)
+    sid, request.state.builder = sessions.get(cookie)
+    response = await call_next(request)
+    if sid != cookie:
+        response.set_cookie(SESSION_COOKIE, sid, httponly=True, samesite="lax",
+                            secure=request.url.scheme == "https")
+    return response
+
+
+def get_builder(request: Request) -> FuzzyBuilder:
+    return request.state.builder
+
 
 # --- Pydantic Models ---
+Name = Annotated[str, AfterValidator(check_name)]
+
+
 class CreateVariable(BaseModel):
-    name: str
+    name: Name
     min_val: float
     max_val: float
-    role: str = "input" # input or output
+    role: str = "input"  # input or output
+
 
 class CreateMF(BaseModel):
-    name: str
+    name: Name
     type: str  # tri, trap, gauss, bell, sig
     params: List[float]
 
+
 class CreateRule(BaseModel):
-    antecedents: Dict[str, str] # {VarName: TermName}
-    consequent: Dict[str, str]  # {VarName: TermName} (Single consequent for now)
+    antecedents: Dict[str, str]  # {VarName: TermName}
+    consequent: Dict[str, str]  # {VarName: TermName} (single consequent)
+
 
 class SimulateRequest(BaseModel):
     inputs: Dict[str, float]
 
-class SystemConfig(BaseModel):
-    variables: Dict[str, CreateVariable] # Reuse logic roughly, or define better structure. 
-    # Actually, export format might differ from create logic.
-    # Let's define a schema for Variable Dump
-    pass
 
 class WangMendelRequest(BaseModel):
-    csv_data: str # base64 encoded csv
+    csv_data: str  # base64 encoded csv
     target_col: str
-    n_terms: int = 5
+    n_terms: int = Field(5, ge=2, le=15)
+
 
 # --- Endpoints ---
+# State endpoints are `async def` so they run one at a time on the event loop and
+# never race on a session's builder (e.g. a simulation poll during an edit).
 
 @app.post("/wang-mendel")
 def run_wang_mendel(req: WangMendelRequest):
+    if len(req.csv_data) > MAX_CSV_BYTES * 4 // 3 + 4:
+        raise HTTPException(status_code=413, detail=f"CSV is too large (limit {MAX_CSV_BYTES // (1024 * 1024)} MB)")
     try:
-        csv_str = base64.b64decode(req.csv_data).decode('utf-8')
+        csv_str = base64.b64decode(req.csv_data, validate=True).decode('utf-8-sig')
         df = pd.read_csv(io.StringIO(csv_str))
-        
-        if req.target_col not in df.columns:
-            raise HTTPException(status_code=400, detail=f"Target column '{req.target_col}' not found in data.")
-            
-        extractor = WangMendelExtractor(n_terms=req.n_terms)
-        extractor.fit(df, req.target_col)
-        config = extractor.export_config(req.target_col)
-        return config
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+    except (binascii.Error, UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError) as e:
+        raise HTTPException(status_code=400, detail=f"Could not read CSV: {e}")
+    df.columns = [str(c).strip() for c in df.columns]
+    if req.target_col not in df.columns:
+        raise HTTPException(status_code=400, detail=f"Target column '{req.target_col}' not found in data.")
+    non_numeric = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
+    if non_numeric:
+        raise HTTPException(status_code=400, detail=f"All columns must be numeric; not numeric: {', '.join(non_numeric)}")
+    df = df.dropna()
+    if df.shape[1] < 2 or df.empty:
+        raise HTTPException(status_code=400, detail="Need at least one input column, the target column and one complete row.")
+    bad = [c for c in df.columns if "/" in c or len(c) > 64]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"Column names must not contain '/' or exceed 64 characters: {', '.join(bad)}")
+
+    extractor = WangMendelExtractor(n_terms=req.n_terms)
+    extractor.fit(df, req.target_col)
+    return extractor.export_config(req.target_col)
+
 
 @app.get("/config")
-def get_config():
-    """Returns current system configuration."""
-    vars_out = {}
-    for name, var in builder.variables.items():
-        terms = {}
-        for t_name, mf in var.terms.items():
-            # Extract params based on type
-            params = []
-            mf_type = type(mf).__name__
-            if isinstance(mf, TriangularMF):
-                params = [mf.a.item(), mf.b.item(), mf.c.item()]
-            elif isinstance(mf, TrapezoidalMF):
-                params = [mf.a.item(), mf.b.item(), mf.c.item(), mf.d.item()]
-            elif isinstance(mf, GaussianMF):
-                params = [mf.mu.item(), mf.sigma.item()]
-            
-            terms[t_name] = {"type": mf_type, "params": params}
-            
-        vars_out[name] = {
-            "min": var.range_min,
-            "max": var.range_max,
-            "role": builder.roles.get(name, "input"),
-            "terms": terms
-        }
-        
-    return {
-        "variables": vars_out,
-        "rules": builder.rules_data
-    }
+async def get_config(b: FuzzyBuilder = Depends(get_builder)):
+    """Returns current system configuration (terms keyed by name)."""
+    return b.export_config(terms_as_dict=True)
+
 
 @app.get("/export")
-def export_system():
-    """Export the full system configuration."""
-    # We can reuse the get_config logic but structure it for re-import
-    # Or just return the raw builder state that creates it.
-    
-    # Let's try to return a structure that mimics what we need to rebuild.
-    # For now, let's just dump the internal state in a clean JSON way.
-    
-    # 1. Variables & Terms
-    vars_export = {}
-    for name, var in builder.variables.items():
-        terms = []
-        for t_name, mf in var.terms.items():
-            params = []
-            mf_type = type(mf).__name__
-            if isinstance(mf, TriangularMF): params = [mf.a.item(), mf.b.item(), mf.c.item()]
-            elif isinstance(mf, TrapezoidalMF): params = [mf.a.item(), mf.b.item(), mf.c.item(), mf.d.item()]
-            elif isinstance(mf, GaussianMF): params = [mf.mu.item(), mf.sigma.item()]
-            # ... others
-            terms.append({"name": t_name, "type": mf_type, "params": params})
-            
-        vars_export[name] = {
-            "min": var.range_min,
-            "max": var.range_max,
-            "role": builder.roles.get(name, "input"),
-            "terms": terms
-        }
-        
-    return {
-        "variables": vars_export,
-        "rules": builder.rules_data
-    }
+async def export_system(b: FuzzyBuilder = Depends(get_builder)):
+    """Export the full system configuration, in the format /import accepts."""
+    return b.export_config()
+
 
 @app.post("/import")
-def import_system(config: Dict[str, Any]):
+async def import_system(config: Dict[str, Any], b: FuzzyBuilder = Depends(get_builder)):
     """Restores system from config."""
     try:
-        # Reset first
-        builder.variables = {}
-        builder.roles = {}
-        builder.rules_data = []
-        builder.system = None
-        
-        # 1. Restore Variables
-        for name, data in config.get("variables", {}).items():
-            var = FuzzyVariable(name, data["min"], data["max"])
-            builder.variables[name] = var
-            builder.roles[name] = data.get("role", "input")
-            
-            # Restore Terms
-            for term in data.get("terms", []):
-                mf = None
-                p = term["params"]
-                t_type = term["type"]
-                # Mapping type names from export back to classes
-                if "TriangularMF" in t_type or t_type == "tri": mf = TriangularMF(p[0], p[1], p[2])
-                elif "TrapezoidalMF" in t_type or t_type == "trap": mf = TrapezoidalMF(p[0], p[1], p[2], p[3])
-                elif "GaussianMF" in t_type or t_type == "gauss": mf = GaussianMF(p[0], p[1])
-                # ... others
-                
-                if mf: var.add_term(term["name"], mf)
-                
-        # 2. Restore Rules
-        builder.rules_data = config.get("rules", [])
-        
-        return {"message": "System imported successfully"}
-        
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Import failed: {str(e)}")
+        b.load_config(config)
+    except (ValueError, TypeError, AttributeError) as e:
+        raise HTTPException(status_code=400, detail=f"Import failed: {e}")
+    return {"message": "System imported successfully"}
+
 
 @app.post("/reset")
-def reset_system():
-    builder.variables = {}
-    builder.roles = {}
-    builder.rules_data = []
-    builder.system = None
+async def reset_system(b: FuzzyBuilder = Depends(get_builder)):
+    b.reset()
     return {"message": "System reset"}
 
-@app.post("/preset/{scenario_id}")
-def load_preset(scenario_id: str):
-    """Loads a FIS preset for a specific laboratory scenario."""
-    builder.variables = {}
-    builder.roles = {}
-    builder.rules_data = []
-    builder.system = None
 
-    if scenario_id == "dc_motor":
-        error = FuzzyVariable("error", -100, 100)
-        builder.variables["error"] = error
-        builder.roles["error"] = "input"
+def _tri_var(lo, hi, role, terms):
+    return {"min": lo, "max": hi, "role": role,
+            "terms": [{"name": n, "type": "tri", "params": p} for n, p in terms.items()]}
 
-        error_dot = FuzzyVariable("error_dot", -50, 50)
-        builder.variables["error_dot"] = error_dot
-        builder.roles["error_dot"] = "input"
 
-        voltage = FuzzyVariable("voltage", -12, 12)
-        builder.roles["voltage"] = "output"
-        builder.variables["voltage"] = voltage
+def _rule(cons, **ants):
+    return {"antecedents": ants, "consequent": cons}
 
-    elif scenario_id == "tank_broken":
-        level = FuzzyVariable("level", -1, 1)
-        level.add_term("low", TriangularMF(-1, -1, 0))
-        level.add_term("okay", TriangularMF(-0.5, 0, 0.5)) # Deliberately broken (too wide)
-        level.add_term("high", TriangularMF(0, 1, 1))
-        builder.variables["level"] = level
-        builder.roles["level"] = "input"
 
-        rate = FuzzyVariable("rate", -0.1, 0.1)
-        rate.add_term("negative", TriangularMF(-0.1, -0.1, 0))
-        rate.add_term("none", TriangularMF(-0.01, 0, 0.01))
-        rate.add_term("positive", TriangularMF(0, 0.1, 0.1))
-        builder.variables["rate"] = rate
-        builder.roles["rate"] = "input"
-
-        valve = FuzzyVariable("valve", -1, 1)
-        valve.add_term("close_fast", TriangularMF(-1, -1, -0.3))
-        valve.add_term("close_slow", TriangularMF(-0.6, -0.3, 0))
-        valve.add_term("no_change", TriangularMF(-0.1, 0, 0.1))
-        valve.add_term("open_slow", TriangularMF(0, 0.2, 0.5))
-        valve.add_term("open_fast", TriangularMF(0.3, 1, 1))
-        builder.variables["valve"] = valve
-        builder.roles["valve"] = "output"
-
+PRESETS = {
+    # Exercise: students define the terms and rules themselves
+    "dc_motor": {
+        "variables": {
+            "error": _tri_var(-100, 100, "input", {}),
+            "error_dot": _tri_var(-50, 50, "input", {}),
+            "voltage": _tri_var(-12, 12, "output", {}),
+        },
+        "rules": [],
+    },
+    "tank_broken": {
+        "variables": {
+            "level": _tri_var(-1, 1, "input", {"low": [-1, -1, 0], "okay": [-0.5, 0, 0.5], "high": [0, 1, 1]}),  # Deliberately broken (too wide)
+            "rate": _tri_var(-0.1, 0.1, "input", {"negative": [-0.1, -0.1, 0], "none": [-0.01, 0, 0.01], "positive": [0, 0.1, 0.1]}),
+            "valve": _tri_var(-1, 1, "output", {"close_fast": [-1, -1, -0.3], "close_slow": [-0.6, -0.3, 0], "no_change": [-0.1, 0, 0.1],
+                                                "open_slow": [0, 0.2, 0.5], "open_fast": [0.3, 1, 1]}),
+        },
         # Broken rules: swapped consequents and missing rule
-        builder.rules_data = [
-            {"antecedents": {"level": "okay"}, "consequent": {"valve": "no_change"}},
-            {"antecedents": {"level": "low"}, "consequent": {"valve": "close_fast"}},
-            {"antecedents": {"level": "high"}, "consequent": {"valve": "open_fast"}},
-            {"antecedents": {"level": "okay", "rate": "positive"}, "consequent": {"valve": "close_slow"}},
-        ]
+        "rules": [
+            _rule({"valve": "no_change"}, level="okay"),
+            _rule({"valve": "close_fast"}, level="low"),
+            _rule({"valve": "open_fast"}, level="high"),
+            _rule({"valve": "close_slow"}, level="okay", rate="positive"),
+        ],
+    },
+    # MathWorks sltank: level error (current - setpoint) and its rate, valve rate of change
+    "tank": {
+        "variables": {
+            "level": _tri_var(-1, 1, "input", {"low": [-1, -1, 0], "okay": [-0.1, 0, 0.1], "high": [0, 1, 1]}),
+            "rate": _tri_var(-0.1, 0.1, "input", {"negative": [-0.1, -0.1, 0], "none": [-0.01, 0, 0.01], "positive": [0, 0.1, 0.1]}),
+            "valve": _tri_var(-1, 1, "output", {"close_fast": [-1, -1, -0.3], "close_slow": [-0.6, -0.3, 0], "no_change": [-0.1, 0, 0.1],
+                                                "open_slow": [0, 0.2, 0.5], "open_fast": [0.3, 1, 1]}),
+        },
+        "rules": [
+            _rule({"valve": "no_change"}, level="okay"),
+            _rule({"valve": "open_fast"}, level="low"),
+            _rule({"valve": "close_fast"}, level="high"),
+            _rule({"valve": "close_slow"}, level="okay", rate="positive"),
+            _rule({"valve": "open_slow"}, level="okay", rate="negative"),
+        ],
+    },
+    "crane": {
+        "variables": {
+            "PosErr": _tri_var(-10, 10, "input", {"Neg": [-10, -10, 0], "Zero": [-1, 0, 1], "Pos": [0, 10, 10]}),
+            "Vel": _tri_var(-5, 5, "input", {"Neg": [-5, -5, 0], "Zero": [-0.5, 0, 0.5], "Pos": [0, 5, 5]}),
+            "Angle": _tri_var(-1, 1, "input", {"Neg": [-1, -1, 0], "Zero": [-0.1, 0, 0.1], "Pos": [0, 1, 1]}),
+            "W": _tri_var(-2, 2, "input", {"Neg": [-2, -2, 0], "Zero": [-0.2, 0, 0.2], "Pos": [0, 2, 2]}),
+            "Force": _tri_var(-30, 30, "output", {"Left": [-30, -30, 0], "Zero": [-2, 0, 2], "Right": [0, 30, 30]}),
+        },
+        # Tuned Rules. Anti-sway: move the trolley toward the side the load swings to
+        "rules": [
+            _rule({"Force": "Right"}, PosErr="Pos"),
+            _rule({"Force": "Left"}, PosErr="Neg"),
+            _rule({"Force": "Left"}, Vel="Pos"),
+            _rule({"Force": "Right"}, Vel="Neg"),
+            _rule({"Force": "Right"}, Angle="Pos"),
+            _rule({"Force": "Left"}, Angle="Neg"),
+            _rule({"Force": "Right"}, W="Pos"),
+            _rule({"Force": "Left"}, W="Neg"),
+        ],
+    },
+    # Distance error and its rate of change
+    "robot_linear": {
+        "variables": {
+            "DistErr": _tri_var(-10, 10, "input", {"Neg": [-10, -10, 0], "Zero": [-1, 0, 1], "Pos": [0, 10, 10]}),
+            "Rate": _tri_var(-2, 2, "input", {"Neg": [-2, -2, 0], "Zero": [-0.3, 0, 0.3], "Pos": [0, 2, 2]}),
+            "Power": _tri_var(-1, 1, "output", {"Reverse": [-1, -1, 0], "Stop": [-0.2, 0, 0.2], "Forward": [0, 1, 1]}),
+        },
+        "rules": [
+            _rule({"Power": "Forward"}, DistErr="Pos"),
+            _rule({"Power": "Reverse"}, DistErr="Neg"),
+            _rule({"Power": "Stop"}, DistErr="Zero"),
+            _rule({"Power": "Reverse"}, DistErr="Zero", Rate="Pos"),
+            _rule({"Power": "Forward"}, DistErr="Zero", Rate="Neg"),
+        ],
+    },
+    # Angular velocity error and its rate
+    "robot_angular": {
+        "variables": {
+            "AngErr": _tri_var(-5, 5, "input", {"Neg": [-5, -5, 0], "Zero": [-0.5, 0, 0.5], "Pos": [0, 5, 5]}),
+            "AngRate": _tri_var(-2, 2, "input", {"Neg": [-2, -2, 0], "Zero": [-0.3, 0, 0.3], "Pos": [0, 2, 2]}),
+            "Steering": _tri_var(-1, 1, "output", {"Left": [-1, -1, 0], "None": [-0.2, 0, 0.2], "Right": [0, 1, 1]}),
+        },
+        "rules": [
+            _rule({"Steering": "Right"}, AngErr="Pos"),
+            _rule({"Steering": "Left"}, AngErr="Neg"),
+            _rule({"Steering": "None"}, AngErr="Zero"),
+            _rule({"Steering": "Left"}, AngErr="Zero", AngRate="Pos"),
+            _rule({"Steering": "Right"}, AngErr="Zero", AngRate="Neg"),
+        ],
+    },
+    # 4 inputs: distance error, dDist, heading error, dHeading; output: linear velocity [0, 1]
+    "robot_nav": {
+        "variables": {
+            "DistErr": _tri_var(0, 10, "input", {"Close": [0, 0, 2], "Medium": [1, 5, 9], "Far": [7, 10, 10]}),
+            "dDist": _tri_var(-2, 2, "input", {"Neg": [-2, -2, 0], "Zero": [-0.3, 0, 0.3], "Pos": [0, 2, 2]}),
+            "HeadErr": _tri_var(-3.15, 3.15, "input", {"Neg": [-3.15, -3.15, 0], "Zero": [-0.3, 0, 0.3], "Pos": [0, 3.15, 3.15]}),
+            "dHead": _tri_var(-1, 1, "input", {"Neg": [-1, -1, 0], "Zero": [-0.15, 0, 0.15], "Pos": [0, 1, 1]}),
+            "Velocity": _tri_var(0, 1, "output", {"Stop": [0, 0, 0.2], "Slow": [0.1, 0.3, 0.5], "Fast": [0.4, 1, 1]}),
+        },
+        "rules": [
+            _rule({"Velocity": "Fast"}, DistErr="Far", HeadErr="Zero"),
+            _rule({"Velocity": "Slow"}, DistErr="Medium"),
+            _rule({"Velocity": "Stop"}, DistErr="Close"),
+            _rule({"Velocity": "Slow"}, HeadErr="Pos"),
+            _rule({"Velocity": "Slow"}, HeadErr="Neg"),
+        ],
+    },
+}
 
-    elif scenario_id == "tank":
-        # Input 1: level error (setpoint - current), normalized [-1, 1]
-        level = FuzzyVariable("level", -1, 1)
-        level.add_term("low", TriangularMF(-1, -1, 0))
-        level.add_term("okay", TriangularMF(-0.1, 0, 0.1))
-        level.add_term("high", TriangularMF(0, 1, 1))
-        builder.variables["level"] = level
-        builder.roles["level"] = "input"
 
-        # Input 2: rate of change of water level
-        rate = FuzzyVariable("rate", -0.1, 0.1)
-        rate.add_term("negative", TriangularMF(-0.1, -0.1, 0))
-        rate.add_term("none", TriangularMF(-0.01, 0, 0.01))
-        rate.add_term("positive", TriangularMF(0, 0.1, 0.1))
-        builder.variables["rate"] = rate
-        builder.roles["rate"] = "input"
-
-        # Output: valve rate of change [-1, 1], 5 MFs (asymmetric)
-        valve = FuzzyVariable("valve", -1, 1)
-        valve.add_term("close_fast", TriangularMF(-1, -1, -0.3))
-        valve.add_term("close_slow", TriangularMF(-0.6, -0.3, 0))
-        valve.add_term("no_change", TriangularMF(-0.1, 0, 0.1))
-        valve.add_term("open_slow", TriangularMF(0, 0.2, 0.5))
-        valve.add_term("open_fast", TriangularMF(0.3, 1, 1))
-        builder.variables["valve"] = valve
-        builder.roles["valve"] = "output"
-
-        # 5 Rules (MathWorks sltank)
-        builder.rules_data = [
-            {"antecedents": {"level": "okay"}, "consequent": {"valve": "no_change"}},
-            {"antecedents": {"level": "low"}, "consequent": {"valve": "open_fast"}},
-            {"antecedents": {"level": "high"}, "consequent": {"valve": "close_fast"}},
-            {"antecedents": {"level": "okay", "rate": "positive"}, "consequent": {"valve": "close_slow"}},
-            {"antecedents": {"level": "okay", "rate": "negative"}, "consequent": {"valve": "open_slow"}}
-        ]
-
-    elif scenario_id == "crane":
-        # Inputs
-        pos = FuzzyVariable("PosErr", -10, 10)
-        pos.add_term("Neg", TriangularMF(-10, -10, 0))
-        pos.add_term("Zero", TriangularMF(-1, 0, 1))
-        pos.add_term("Pos", TriangularMF(0, 10, 10))
-        builder.variables["PosErr"] = pos
-        builder.roles["PosErr"] = "input"
-
-        vel = FuzzyVariable("Vel", -5, 5)
-        vel.add_term("Neg", TriangularMF(-5, -5, 0))
-        vel.add_term("Zero", TriangularMF(-0.5, 0, 0.5))
-        vel.add_term("Pos", TriangularMF(0, 5, 5))
-        builder.variables["Vel"] = vel
-        builder.roles["Vel"] = "input"
-
-        angle = FuzzyVariable("Angle", -1, 1)
-        angle.add_term("Neg", TriangularMF(-1, -1, 0))
-        angle.add_term("Zero", TriangularMF(-0.1, 0, 0.1))
-        angle.add_term("Pos", TriangularMF(0, 1, 1))
-        builder.variables["Angle"] = angle
-        builder.roles["Angle"] = "input"
-
-        w = FuzzyVariable("W", -2, 2)
-        w.add_term("Neg", TriangularMF(-2, -2, 0))
-        w.add_term("Zero", TriangularMF(-0.2, 0, 0.2))
-        w.add_term("Pos", TriangularMF(0, 2, 2))
-        builder.variables["W"] = w
-        builder.roles["W"] = "input"
-
-        # Output
-        f = FuzzyVariable("Force", -30, 30)
-        f.add_term("Left", TriangularMF(-30, -30, 0))
-        f.add_term("Zero", TriangularMF(-2, 0, 2))
-        f.add_term("Right", TriangularMF(0, 30, 30))
-        builder.variables["Force"] = f
-        builder.roles["Force"] = "output"
-
-        # Tuned Rules
-        builder.rules_data = [
-            {"antecedents": {"PosErr": "Pos"}, "consequent": {"Force": "Right"}},
-            {"antecedents": {"PosErr": "Neg"}, "consequent": {"Force": "Left"}},
-            {"antecedents": {"Vel": "Pos"}, "consequent": {"Force": "Left"}},
-            {"antecedents": {"Vel": "Neg"}, "consequent": {"Force": "Right"}},
-            {"antecedents": {"Angle": "Pos"}, "consequent": {"Force": "Left"}},
-            {"antecedents": {"Angle": "Neg"}, "consequent": {"Force": "Right"}},
-            {"antecedents": {"W": "Pos"}, "consequent": {"Force": "Left"}},
-            {"antecedents": {"W": "Neg"}, "consequent": {"Force": "Right"}}
-        ]
-
-    elif scenario_id == "robot_linear":
-        # Distance error and its rate of change
-        dist = FuzzyVariable("DistErr", -10, 10)
-        dist.add_term("Neg", TriangularMF(-10, -10, 0))
-        dist.add_term("Zero", TriangularMF(-1, 0, 1))
-        dist.add_term("Pos", TriangularMF(0, 10, 10))
-        builder.variables["DistErr"] = dist
-        builder.roles["DistErr"] = "input"
-
-        rate = FuzzyVariable("Rate", -2, 2)
-        rate.add_term("Neg", TriangularMF(-2, -2, 0))
-        rate.add_term("Zero", TriangularMF(-0.3, 0, 0.3))
-        rate.add_term("Pos", TriangularMF(0, 2, 2))
-        builder.variables["Rate"] = rate
-        builder.roles["Rate"] = "input"
-
-        power = FuzzyVariable("Power", -1, 1)
-        power.add_term("Reverse", TriangularMF(-1, -1, 0))
-        power.add_term("Stop", TriangularMF(-0.2, 0, 0.2))
-        power.add_term("Forward", TriangularMF(0, 1, 1))
-        builder.variables["Power"] = power
-        builder.roles["Power"] = "output"
-
-        builder.rules_data = [
-            {"antecedents": {"DistErr": "Pos"}, "consequent": {"Power": "Forward"}},
-            {"antecedents": {"DistErr": "Neg"}, "consequent": {"Power": "Reverse"}},
-            {"antecedents": {"DistErr": "Zero"}, "consequent": {"Power": "Stop"}},
-            {"antecedents": {"DistErr": "Zero", "Rate": "Pos"}, "consequent": {"Power": "Reverse"}},
-            {"antecedents": {"DistErr": "Zero", "Rate": "Neg"}, "consequent": {"Power": "Forward"}}
-        ]
-
-    elif scenario_id == "robot_angular":
-        # Angular velocity error and its rate
-        ang_err = FuzzyVariable("AngErr", -5, 5)
-        ang_err.add_term("Neg", TriangularMF(-5, -5, 0))
-        ang_err.add_term("Zero", TriangularMF(-0.5, 0, 0.5))
-        ang_err.add_term("Pos", TriangularMF(0, 5, 5))
-        builder.variables["AngErr"] = ang_err
-        builder.roles["AngErr"] = "input"
-
-        ang_rate = FuzzyVariable("AngRate", -2, 2)
-        ang_rate.add_term("Neg", TriangularMF(-2, -2, 0))
-        ang_rate.add_term("Zero", TriangularMF(-0.3, 0, 0.3))
-        ang_rate.add_term("Pos", TriangularMF(0, 2, 2))
-        builder.variables["AngRate"] = ang_rate
-        builder.roles["AngRate"] = "input"
-
-        steer = FuzzyVariable("Steering", -1, 1)
-        steer.add_term("Left", TriangularMF(-1, -1, 0))
-        steer.add_term("None", TriangularMF(-0.2, 0, 0.2))
-        steer.add_term("Right", TriangularMF(0, 1, 1))
-        builder.variables["Steering"] = steer
-        builder.roles["Steering"] = "output"
-
-        builder.rules_data = [
-            {"antecedents": {"AngErr": "Pos"}, "consequent": {"Steering": "Right"}},
-            {"antecedents": {"AngErr": "Neg"}, "consequent": {"Steering": "Left"}},
-            {"antecedents": {"AngErr": "Zero"}, "consequent": {"Steering": "None"}},
-            {"antecedents": {"AngErr": "Zero", "AngRate": "Pos"}, "consequent": {"Steering": "Left"}},
-            {"antecedents": {"AngErr": "Zero", "AngRate": "Neg"}, "consequent": {"Steering": "Right"}}
-        ]
-
-    elif scenario_id == "robot_nav":
-        # 4 inputs: distance error, dDist, heading error, dHeading
-        dist = FuzzyVariable("DistErr", 0, 10)
-        dist.add_term("Close", TriangularMF(0, 0, 2))
-        dist.add_term("Medium", TriangularMF(1, 5, 9))
-        dist.add_term("Far", TriangularMF(7, 10, 10))
-        builder.variables["DistErr"] = dist
-        builder.roles["DistErr"] = "input"
-
-        ddist = FuzzyVariable("dDist", -2, 2)
-        ddist.add_term("Neg", TriangularMF(-2, -2, 0))
-        ddist.add_term("Zero", TriangularMF(-0.3, 0, 0.3))
-        ddist.add_term("Pos", TriangularMF(0, 2, 2))
-        builder.variables["dDist"] = ddist
-        builder.roles["dDist"] = "input"
-
-        head = FuzzyVariable("HeadErr", -3.15, 3.15)
-        head.add_term("Neg", TriangularMF(-3.15, -3.15, 0))
-        head.add_term("Zero", TriangularMF(-0.3, 0, 0.3))
-        head.add_term("Pos", TriangularMF(0, 3.15, 3.15))
-        builder.variables["HeadErr"] = head
-        builder.roles["HeadErr"] = "input"
-
-        dhead = FuzzyVariable("dHead", -1, 1)
-        dhead.add_term("Neg", TriangularMF(-1, -1, 0))
-        dhead.add_term("Zero", TriangularMF(-0.15, 0, 0.15))
-        dhead.add_term("Pos", TriangularMF(0, 1, 1))
-        builder.variables["dHead"] = dhead
-        builder.roles["dHead"] = "input"
-
-        # Output: linear velocity [0, 1]
-        vel = FuzzyVariable("Velocity", 0, 1)
-        vel.add_term("Stop", TriangularMF(0, 0, 0.2))
-        vel.add_term("Slow", TriangularMF(0.1, 0.3, 0.5))
-        vel.add_term("Fast", TriangularMF(0.4, 1, 1))
-        builder.variables["Velocity"] = vel
-        builder.roles["Velocity"] = "output"
-
-        builder.rules_data = [
-            {"antecedents": {"DistErr": "Far", "HeadErr": "Zero"}, "consequent": {"Velocity": "Fast"}},
-            {"antecedents": {"DistErr": "Medium"}, "consequent": {"Velocity": "Slow"}},
-            {"antecedents": {"DistErr": "Close"}, "consequent": {"Velocity": "Stop"}},
-            {"antecedents": {"HeadErr": "Pos"}, "consequent": {"Velocity": "Slow"}},
-            {"antecedents": {"HeadErr": "Neg"}, "consequent": {"Velocity": "Slow"}}
-        ]
-
-    else:
+@app.post("/preset/{scenario_id}")
+async def load_preset(scenario_id: str, b: FuzzyBuilder = Depends(get_builder)):
+    """Loads a FIS preset for a specific laboratory scenario."""
+    if scenario_id not in PRESETS:
         raise HTTPException(status_code=404, detail="Scenario not found")
-
+    b.load_config(PRESETS[scenario_id])
     return {"message": f"Preset for {scenario_id} loaded"}
 
+
 @app.post("/variable")
-def create_variable(data: CreateVariable):
-    builder.variables[data.name] = FuzzyVariable(data.name, data.min_val, data.max_val)
-    builder.roles[data.name] = data.role
+async def create_variable(data: CreateVariable, b: FuzzyBuilder = Depends(get_builder)):
+    try:
+        b.add_variable(data.name, data.min_val, data.max_val, data.role)
+    except ValueError as e:
+        raise http_400(e)
     return {"message": f"Variable {data.name} created"}
 
+
 @app.delete("/variable/{name}")
-def delete_variable(name: str):
-    builder.delete_variable(name)
+async def delete_variable(name: str, b: FuzzyBuilder = Depends(get_builder)):
+    b.delete_variable(name)
     return {"message": f"Variable {name} deleted"}
 
+
 @app.delete("/variable/{name}/term/{term}")
-def delete_term(name: str, term: str):
-    builder.delete_term(name, term)
+async def delete_term(name: str, term: str, b: FuzzyBuilder = Depends(get_builder)):
+    b.delete_term(name, term)
     return {"message": f"Term {term} deleted from {name}"}
 
+
 @app.delete("/rule/{index}")
-def delete_rule(index: int):
-    builder.delete_rule(index)
+async def delete_rule(index: int, b: FuzzyBuilder = Depends(get_builder)):
+    b.delete_rule(index)
     return {"message": f"Rule {index} deleted"}
 
+
 @app.post("/variable/{name}/term")
-def add_term(name: str, data: CreateMF):
-    var = builder.get_variable(name)
-    
-    mf = None
-    p = data.params
-    if data.type == "tri":
-        mf = TriangularMF(p[0], p[1], p[2])
-    elif data.type == "trap":
-        mf = TrapezoidalMF(p[0], p[1], p[2], p[3])
-    elif data.type == "gauss":
-        mf = GaussianMF(p[0], p[1])
-    elif data.type == "bell":
-        mf = BellMF(p[0], p[1], p[2])
-    elif data.type == "sig":
-        mf = SigmoidMF(p[0], p[1])
-    else:
-        raise HTTPException(status_code=400, detail="Unknown MF type")
-        
-    var.add_term(data.name, mf)
+async def add_term(name: str, data: CreateMF, b: FuzzyBuilder = Depends(get_builder)):
+    try:
+        b.add_term(name, data.name, data.type, data.params)
+    except ValueError as e:
+        raise http_400(e)
     return {"message": f"Term {data.name} added to {name}"}
 
-@app.post("/rule")
-def add_rule(data: CreateRule):
-    # Just store for now, validate existence
-    for v, t in data.antecedents.items():
-        if v not in builder.variables or t not in builder.variables[v].terms:
-             raise HTTPException(status_code=400, detail=f"Invalid antecedent {v}:{t}")
-    
-    cons_var = list(data.consequent.keys())[0]
-    cons_term = list(data.consequent.values())[0]
-    if cons_var not in builder.variables or cons_term not in builder.variables[cons_var].terms:
-        raise HTTPException(status_code=400, detail=f"Invalid consequent {cons_var}:{cons_term}")
 
-    builder.rules_data.append(data.dict())
-    builder.system = None # Invalidate built system
+@app.post("/rule")
+async def add_rule(data: CreateRule, b: FuzzyBuilder = Depends(get_builder)):
+    try:
+        b.add_rule(data.antecedents, data.consequent)
+    except ValueError as e:
+        raise http_400(e)
     return {"message": "Rule added"}
 
+
 @app.post("/build")
-def build_system():
-    """Builds the system using defined input/output roles."""
-    
-    # Identify output logic
-    outputs = [n for n, r in builder.roles.items() if r == 'output']
-    if not outputs:
-        # Fallback if no output defined explicitly? Or error.
-        # Let's try to auto-detect from rules? No, enforce role.
-        raise HTTPException(status_code=400, detail="No output variable defined. Please create a variable with role='output'.")
-    
-    output_var_name = outputs[0] # Single output supported for now
-    
-    inputs = [v for k, v in builder.variables.items() if builder.roles.get(k) == 'input']
-    output = builder.variables[output_var_name]
-    
-    rules = []
-    for r_data in builder.rules_data:
-        antecedents = []
-        for v_name, t_name in r_data['antecedents'].items():
-            antecedents.append((builder.variables[v_name], t_name))
-        
-        # Consequent
-        c_name = list(r_data['consequent'].keys())[0]
-        c_term = list(r_data['consequent'].values())[0]
-        
-        rules.append(FuzzyRule(antecedent=antecedents, consequent=(builder.variables[c_name], c_term)))
-        
-    builder.system = FuzzyModule(inputs=inputs, output=output, rules=rules, defuzz_method=Centroid(output.range_min, output.range_max))
+async def build_system(b: FuzzyBuilder = Depends(get_builder)):
+    """Checks that the system can be built. /simulate also builds on demand."""
+    b.invalidate()
+    b.system()
     return {"message": "System built successfully"}
 
+
 @app.post("/simulate")
-def simulate(data: SimulateRequest):
-    if not builder.system:
-        raise HTTPException(status_code=400, detail="System not built yet")
-        
-    # Convert inputs to tensor dict
-    inputs_torch = {k: torch.tensor([v]) for k, v in data.inputs.items()}
-    
-    try:
-        # Get Activations
-        activations = builder.system.get_rule_activations(inputs_torch)[0] # (num_rules,)
-        
-        # Get Output
-        output = builder.system(inputs_torch)
-        
+async def simulate(data: SimulateRequest, b: FuzzyBuilder = Depends(get_builder)):
+    system = b.system()
+    missing = [v for v in b.required_inputs() if v not in data.inputs]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing input value(s): {', '.join(missing)}")
+    if not all(math.isfinite(v) for v in data.inputs.values()):
+        raise HTTPException(status_code=400, detail="Input values must be finite numbers")
+
+    inputs_torch = {k: torch.tensor([v]) for k, v in data.inputs.items() if k in system.input_variables}
+    with torch.no_grad():
+        activations = system.get_rule_activations(inputs_torch)[0]  # (num_rules,)
+        output = system(inputs_torch).item()  # NaN when no rule fires
+
         input_memberships = {}
         for var_name, val in data.inputs.items():
-            if var_name in builder.variables:
-                var = builder.variables[var_name]
-                input_memberships[var_name] = {}
-                for t_name, mf in var.terms.items():
-                    input_memberships[var_name][t_name] = mf(torch.tensor([val])).item()
+            if b.roles.get(var_name) == "input" and var_name in b.variables:
+                var = b.variables[var_name]
+                input_memberships[var_name] = {t: mf(torch.tensor([val])).item() for t, mf in var.terms.items()}
 
-        universe = builder.system.defuzz.universe
-        aggregated_mf = torch.zeros(builder.system.defuzz.resolution, device=universe.device)
-        
+        universe = system.defuzz.universe
+        aggregated_mf = torch.zeros_like(universe)
         rule_contributions = []
-        for i, rule in enumerate(builder.system.rules):
+        for i, rule in enumerate(system.rules):
             strength = activations[i].item()
-            if strength > 1e-4:
-                full_cons_term = builder.system.output_variable.terms[rule.consequent[1]]
-                cons_mf_values = full_cons_term(universe)
-                rule_output = torch.min(torch.tensor([strength]), cons_mf_values)
-                
-                rd = builder.rules_data[i]
-                parts = [f"{v} IS {t}" for v, t in rd.get("antecedents", {}).items()]
-                desc = f"IF {' AND '.join(parts)} THEN {list(rd.get('consequent', {}).keys())[0]} IS {list(rd.get('consequent', {}).values())[0]}"
-                
-                rule_contributions.append({
-                    "index": i,
-                    "description": desc,
-                    "config": rd,
-                    "strength": strength,
-                    "consequent_term": rule.consequent[1],
-                    "clipped_shape": rule_output.tolist()
-                })
-                
-                if i == 0:
-                    aggregated_mf = rule_output
-                else:
-                    aggregated_mf = builder.system.aggregation(aggregated_mf, rule_output)
-                
-        return {
-            "output": output.item(),
-            "rules_triggered": rule_contributions,
-            "input_memberships": input_memberships,
-            "aggregated_output_shape": {
-                "x": universe.tolist(),
-                "y": aggregated_mf.tolist()
-            }
-        }
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+            if strength <= 1e-4:
+                continue
+            cons_mf_values = system.output_variable.terms[rule.consequent[1]](universe)
+            rule_output = system.implication(torch.tensor([strength]), cons_mf_values)
+            aggregated_mf = system.aggregation(aggregated_mf, rule_output)
+
+            rd = b.rules_data[i]
+            (c_var, c_term), = rd["consequent"].items()
+            parts = [f"{v} IS {t}" for v, t in rd["antecedents"].items()]
+            rule_contributions.append({
+                "index": i,
+                "description": f"IF {' AND '.join(parts)} THEN {c_var} IS {c_term}",
+                "config": rd,
+                "strength": strength,
+                "consequent_term": c_term,
+                "clipped_shape": rule_output.tolist(),
+            })
+
+    no_rule_fired = not math.isfinite(output)
+    return {
+        "output": None if no_rule_fired else output,
+        "no_rule_fired": no_rule_fired,
+        "rules_triggered": rule_contributions,
+        "input_memberships": input_memberships,
+        "aggregated_output_shape": {
+            "x": universe.tolist(),
+            "y": aggregated_mf.tolist(),
+        },
+    }
+
 
 @app.get("/plot/{var_name}")
-def get_plot_data(var_name: str):
-    var = builder.get_variable(var_name)
+async def get_plot_data(var_name: str, b: FuzzyBuilder = Depends(get_builder)):
+    var = b.get_variable(var_name)
     x = torch.linspace(var.range_min, var.range_max, 200)
-    data = {"x": x.tolist(), "terms": {}}
-    
-    for t_name, mf in var.terms.items():
-        y = mf(x)
-        data["terms"][t_name] = y.tolist()
-        
-    return data
+    with torch.no_grad():
+        terms = {t_name: mf(x).tolist() for t_name, mf in var.terms.items()}
+    return {"x": x.tolist(), "terms": terms}
+
 
 # Mount UI
-app.mount("/", StaticFiles(directory="ui", html=True), name="ui")
+app.mount("/", StaticFiles(directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui"), html=True), name="ui")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=os.environ.get("HOST", "0.0.0.0"), port=int(os.environ.get("PORT", 8000)))

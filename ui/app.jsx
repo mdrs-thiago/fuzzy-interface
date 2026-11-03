@@ -69,11 +69,89 @@ const Select = ({ label, children, ...props }) => (
 // --- Config ---
 const COLORS = ["#a78bfa", "#34d399", "#fbbf24", "#f472b6", "#60a5fa"];
 
+// --- Membership functions (mirrors fuzzy_torch, for live drag preview) ---
+const MF_TYPE_SHORT = { TriangularMF: 'tri', TrapezoidalMF: 'trap', GaussianMF: 'gauss', BellMF: 'bell', SigmoidMF: 'sig' };
+const shortMFType = (type) => MF_TYPE_SHORT[type] || type;
+
+// Linear ramp that becomes a step when lo == hi (shoulder sets)
+const ramp = (x, lo, hi, rising) => hi === lo
+    ? (rising ? (x >= hi ? 1 : 0) : (x <= lo ? 1 : 0))
+    : (rising ? (x - lo) / (hi - lo) : (hi - x) / (hi - lo));
+const MF_EVAL = {
+    tri: (x, [a, b, c]) => Math.max(0, Math.min(ramp(x, a, b, true), ramp(x, b, c, false), 1)),
+    trap: (x, [a, b, c, d]) => Math.max(0, Math.min(ramp(x, a, b, true), 1, ramp(x, c, d, false))),
+    gauss: (x, [mu, sigma]) => Math.exp(-0.5 * Math.pow((x - mu) / sigma, 2)),
+    bell: (x, [a, b, c]) => 1 / (1 + Math.pow(Math.abs((x - c) / a), 2 * b)),
+    sig: (x, [b, c]) => 1 / (1 + Math.exp(-b * (x - c))),
+};
+// Parameter indices that are positions on the x axis (the ones you can drag)
+const MF_DRAGGABLE = { tri: [0, 1, 2], trap: [0, 1, 2, 3], gauss: [0], bell: [2], sig: [1] };
+
 const downloadJSON = (data, filename) => {
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a'); a.href = url; a.download = filename; a.click(); URL.revokeObjectURL(url);
 };
+
+// --- API ---
+const enc = encodeURIComponent;
+
+const errorMessage = (detail, status) => {
+    if (Array.isArray(detail)) return detail.map(d => d.msg || JSON.stringify(d)).join("; ");
+    return detail || `Request failed (${status})`;
+};
+
+// fetch() wrapper: sends JSON, returns parsed JSON, throws Error(detail) on non-2xx responses
+const api = async (path, { method = "GET", body } = {}) => {
+    const opts = { method };
+    if (body !== undefined) {
+        opts.headers = { "Content-Type": "application/json" };
+        opts.body = typeof body === "string" ? body : JSON.stringify(body);
+    }
+    const res = await fetch(path, opts);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(errorMessage(data.detail, res.status));
+    return data;
+};
+
+// Runs an action and alerts on failure; returns true on success
+const attempt = async (fn) => {
+    try { await fn(); return true; }
+    catch (e) { alert("Error: " + e.message); return false; }
+};
+
+const simulateFIS = (inputs) => api("/simulate", { method: "POST", body: { inputs } });
+
+const bytesToBase64 = (bytes) => {
+    // Chunked: spreading a large array into String.fromCharCode overflows the call stack
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(binary);
+};
+
+class ErrorBoundary extends React.Component {
+    constructor(props) { super(props); this.state = { error: null }; }
+    static getDerivedStateFromError(error) { return { error }; }
+    componentDidCatch(error, info) { console.error(error, info); }
+    render() {
+        if (!this.state.error) return this.props.children;
+        return (
+            <div className="flex-1 flex items-center justify-center p-8">
+                <div className="text-center p-10 bg-white border border-rose-200 rounded-3xl shadow-xl max-w-md">
+                    <h2 className="text-lg font-black text-rose-600 mb-2">Something went wrong in this view</h2>
+                    <p className="text-xs text-zinc-500 font-mono mb-6 break-words">{String(this.state.error.message || this.state.error)}</p>
+                    <Button variant="secondary" onClick={() => this.setState({ error: null })}>Try again</Button>
+                </div>
+            </div>
+        );
+    }
+}
+
+const SimError = ({ message }) => message ? (
+    <div className="w-full max-w-6xl shrink-0 p-4 bg-rose-50 border border-rose-200 rounded-xl text-rose-600 text-sm font-bold">{message}</div>
+) : null;
 
 // ----------------------------------------------------------------------
 // Main Application
@@ -93,8 +171,9 @@ function DataDrivenView({ config, refresh }) {
         if (!file) return;
         const reader = new FileReader();
         reader.onload = (ev) => {
-            const text = ev.target.result;
+            const text = ev.target.result.replace(/^﻿/, "");
             setCsvData(text);
+            setResult(null);
             const firstLine = text.split('\n')[0];
             if (firstLine) {
                 const cols = firstLine.split(',').map(c => c.trim()).filter(c => c);
@@ -108,34 +187,24 @@ function DataDrivenView({ config, refresh }) {
     const handleRun = async () => {
         if (!csvData) return alert("Please upload a CSV file first.");
         setLoading(true);
-        try {
+        await attempt(async () => {
             // Encode as base64 to avoid JSON string escaping issues
-            const utf8Bytes = new TextEncoder().encode(csvData);
-            const b64 = btoa(String.fromCharCode(...utf8Bytes));
-            const res = await fetch("/wang-mendel", {
+            const b64 = bytesToBase64(new TextEncoder().encode(csvData));
+            setResult(await api("/wang-mendel", {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ csv_data: b64, target_col: targetCol, n_terms: parseInt(nTerms) })
-            });
-            if (!res.ok) {
-                const err = await res.json();
-                throw new Error(err.detail);
-            }
-            const data = await res.json();
-            setResult(data);
-        } catch (e) {
-            alert("Error: " + e.message);
-        }
+                body: { csv_data: b64, target_col: targetCol, n_terms: parseInt(nTerms) }
+            }));
+        });
         setLoading(false);
     };
 
     const handleImport = async () => {
         if (!result) return;
         try {
-            await fetch("/import", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(result) });
+            await api("/import", { method: "POST", body: result });
             refresh();
             alert("Rules imported to FIS Builder successfully! Check the Editor and Rules tabs.");
-        } catch(e) { alert("Import failed: " + e.message); }
+        } catch (e) { alert(e.message); }
     };
 
     return (
@@ -238,27 +307,26 @@ function App() {
 
     const refresh = async () => {
         try {
-            const res = await fetch("/config");
-            const data = await res.json();
+            const data = await api("/config");
             setConfig(data);
-            // Ensure valid selection
-            if (view === 'editor' && !selectedVarName && Object.keys(data.variables).length > 0) {
-                setSelectedVarName(Object.keys(data.variables)[0]);
-            }
+            // Ensure valid selection (the selected variable may have been deleted or replaced)
+            setSelectedVarName(cur => (cur && data.variables[cur]) ? cur : (Object.keys(data.variables)[0] || null));
         } catch (e) { console.error(e); }
     };
 
     useEffect(() => { refresh(); }, [view]);
 
     // Import/Export
-    const handleExport = async () => {
-        const res = await fetch("/export"); downloadJSON(await res.json(), `fuzzy_system.json`);
-    };
+    const handleExport = () => attempt(async () => downloadJSON(await api("/export"), `fuzzy_system.json`));
     const handleImport = (e) => {
         const file = e.target.files[0]; if (!file) return;
+        e.target.value = ""; // allow re-importing the same file
         const reader = new FileReader();
         reader.onload = async (ev) => {
-            try { await fetch("/import", { method: "POST", headers: { "Content-Type": "application/json" }, body: ev.target.result }); refresh(); } catch (e) { alert("Import failed"); }
+            try {
+                await api("/import", { method: "POST", body: JSON.parse(ev.target.result) });
+                refresh();
+            } catch (e) { alert(e instanceof SyntaxError ? "Import failed: file is not valid JSON" : e.message); }
         };
         reader.readAsText(file);
     };
@@ -293,10 +361,12 @@ function App() {
 
             {/* Main Workspace */}
             <div className="flex-1 flex min-h-0">
-                {view === "editor" && <IDEView config={config} refresh={refresh} selectedVarName={selectedVarName} setSelectedVarName={setSelectedVarName} />}
-                {view === "rules" && <RulesView config={config} refresh={refresh} />}
-                {view === "data-driven" && <DataDrivenView config={config} refresh={refresh} />}
-                {view === "simulations" && <SimulateView config={config} refresh={refresh} />}
+                <ErrorBoundary key={view}>
+                    {view === "editor" && <IDEView config={config} refresh={refresh} selectedVarName={selectedVarName} setSelectedVarName={setSelectedVarName} />}
+                    {view === "rules" && <RulesView config={config} refresh={refresh} />}
+                    {view === "data-driven" && <DataDrivenView config={config} refresh={refresh} />}
+                    {view === "simulations" && <SimulateView config={config} refresh={refresh} />}
+                </ErrorBoundary>
             </div>
         </div>
     );
@@ -319,18 +389,20 @@ function IDEView({ config, refresh, selectedVarName, setSelectedVarName }) {
     };
 
     const confirmCreation = async () => {
-        if (!createForm.name) return;
-        await fetch("/variable", {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                name: createForm.name,
+        const name = createForm.name.trim();
+        if (!name) return;
+        const ok = await attempt(() => api("/variable", {
+            method: "POST",
+            body: {
+                name,
                 min_val: parseFloat(createForm.min),
                 max_val: parseFloat(createForm.max),
                 role: creationState.role
-            })
-        });
-        refresh();
-        setSelectedVarName(createForm.name);
+            }
+        }));
+        if (!ok) return;
+        await refresh();
+        setSelectedVarName(name);
         setCreationState(null);
     };
 
@@ -435,14 +507,14 @@ function VariableEditor({ name, data, refresh }) {
     const chartRef = useRef(null);
 
     const fetchPlotData = () => {
-        fetch(`/plot/${name}`).then(r => r.json()).then(d => {
+        api(`/plot/${enc(name)}`).then(d => {
             const fmt = d.x.map((x, i) => {
                 const row = { x };
                 Object.keys(d.terms).forEach(t => row[t] = d.terms[t][i]);
                 return row;
             });
             setPlotData(fmt);
-        });
+        }).catch(e => console.error(e));
     };
 
     useEffect(() => {
@@ -453,10 +525,12 @@ function VariableEditor({ name, data, refresh }) {
 
     const addTerm = async () => {
         const p = termForm.params.split(',').map(x => parseFloat(x));
-        await fetch(`/variable/${name}/term`, {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name: termForm.name || "Term", type: termForm.type, params: p })
-        });
+        if (p.some(v => !Number.isFinite(v))) return alert("Parameters must be comma-separated numbers.");
+        const ok = await attempt(() => api(`/variable/${enc(name)}/term`, {
+            method: "POST",
+            body: { name: termForm.name.trim() || "Term", type: termForm.type, params: p }
+        }));
+        if (!ok) return;
         setEditingTerm(null);
         setTermForm({ name: "", type: "tri", params: `${data.min.toFixed(1)}, ${((data.min + data.max) / 2).toFixed(1)}, ${data.max.toFixed(1)}` });
         refresh();
@@ -465,9 +539,7 @@ function VariableEditor({ name, data, refresh }) {
     const startEditTerm = (tName) => {
         const term = data.terms[tName];
         if (!term) return;
-        const typeMap = { 'TriangularMF': 'tri', 'TrapezoidalMF': 'trap', 'GaussianMF': 'gauss', 'BellMF': 'bell', 'SigmoidMF': 'sig' };
-        const shortType = typeMap[term.type] || term.type.toLowerCase().replace('mf', '');
-        setTermForm({ name: tName, type: shortType, params: term.params.join(', ') });
+        setTermForm({ name: tName, type: shortMFType(term.type), params: term.params.join(', ') });
         setEditingTerm(tName);
     };
 
@@ -477,18 +549,14 @@ function VariableEditor({ name, data, refresh }) {
     };
 
     const deleteTerm = async (t) => {
-        await fetch(`/variable/${name}/term/${t}`, { method: "DELETE" });
+        await attempt(() => api(`/variable/${enc(name)}/term/${enc(t)}`, { method: "DELETE" }));
+        if (editingTerm === t) cancelEdit();
         refresh();
     };
 
-    // --- MF Math for Live Preview ---
-    const triMF = (x, a, b, c) => Math.max(0, Math.min((x - a) / (b - a || 1), (c - x) / (c - b || 1)));
-    const trapMF = (x, a, b, c, d) => Math.max(0, Math.min((x - a) / (b - a || 1), 1, (d - x) / (d - c || 1)));
-    const gaussMF = (x, mu, sigma) => Math.exp(-Math.pow(x - mu, 2) / (2 * Math.pow(sigma || 1, 2)));
-
     const deleteVar = async () => {
         if (confirm(`Delete variable '${name}'?`)) {
-            await fetch(`/variable/${name}`, { method: "DELETE" });
+            await attempt(() => api(`/variable/${enc(name)}`, { method: "DELETE" }));
             refresh();
         }
     };
@@ -503,12 +571,12 @@ function VariableEditor({ name, data, refresh }) {
         let minDist = (data.max - data.min) * 0.05; // 5% threshold
 
         Object.entries(data.terms).forEach(([tName, term]) => {
-            const params = term.params;
-            params.forEach((p, idx) => {
-                const d = Math.abs(p - xValue);
+            const type = shortMFType(term.type);
+            (MF_DRAGGABLE[type] || []).forEach(idx => {
+                const d = Math.abs(term.params[idx] - xValue);
                 if (d < minDist) {
                     minDist = d;
-                    best = { termKey: tName, index: idx, type: term.type };
+                    best = { termKey: tName, index: idx, type };
                 }
             });
         });
@@ -526,10 +594,8 @@ function VariableEditor({ name, data, refresh }) {
         const updatedParams = [...dragging.originalParams];
         updatedParams[dragging.index] = newVal;
 
-        // Optional: Enforce ordering for Tri/Trap
-        if (dragging.type.includes("Triangular") || dragging.type === "tri") {
-            updatedParams.sort((a, b) => a - b);
-        } else if (dragging.type.includes("Trapezoidal") || dragging.type === "trap") {
+        // Enforce ordering for Tri/Trap
+        if (dragging.type === "tri" || dragging.type === "trap") {
             updatedParams.sort((a, b) => a - b);
         }
 
@@ -545,19 +611,14 @@ function VariableEditor({ name, data, refresh }) {
             return;
         }
 
-        // Commit to backend
-        const t = data.terms[dragging.termKey];
-        await fetch(`/variable/${name}/term`, {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                name: dragging.termKey,
-                type: t.type.toLowerCase().includes("tri") ? "tri" :
-                    t.type.toLowerCase().includes("trap") ? "trap" : "gauss",
-                params: dragging.currentParams
-            })
-        });
-
+        // Commit to backend (clear drag state first so mouseleave can't commit twice)
+        const { termKey, type, currentParams } = dragging;
         setDragging(null);
+        await attempt(() => api(`/variable/${enc(name)}/term`, {
+            method: "POST",
+            body: { name: termKey, type, params: currentParams }
+        }));
+
         refresh();
         fetchPlotData();
     };
@@ -567,20 +628,10 @@ function VariableEditor({ name, data, refresh }) {
         if (!dragging || !dragging.currentParams) return plotData;
 
         const { termKey, type, currentParams } = dragging;
-        const p = currentParams;
+        const evalMF = MF_EVAL[type];
+        if (!evalMF) return plotData;
 
-        return plotData.map(row => {
-            const newRow = { ...row };
-            const x = row.x;
-
-            let val = 0;
-            if (type.includes("Triangular") || type === "tri") val = triMF(x, p[0], p[1], p[2]);
-            else if (type.includes("Trapezoidal") || type === "trap") val = trapMF(x, p[0], p[1], p[2], p[3]);
-            else if (type.includes("Gaussian") || type === "gauss") val = gaussMF(x, p[0], p[1]);
-
-            newRow[termKey] = val;
-            return newRow;
-        });
+        return plotData.map(row => ({ ...row, [termKey]: evalMF(row.x, currentParams) }));
     }, [plotData, dragging]);
 
     return (
@@ -661,10 +712,12 @@ function VariableEditor({ name, data, refresh }) {
                                 <option value="tri">Triangular (a, b, c)</option>
                                 <option value="trap">Trapezoidal (a, b, c, d)</option>
                                 <option value="gauss">Gaussian (μ, σ)</option>
+                                <option value="bell">Generalized Bell (a, b, c)</option>
+                                <option value="sig">Sigmoid (slope, center)</option>
                             </Select>
                         </div>
                         <div className="md:col-span-4"><Input label="Parameters" placeholder="0.0, 5.0, 10.0" value={termForm.params} onChange={e => setTermForm({ ...termForm, params: e.target.value })} /></div>
-                        <div className="md:col-span-2"><Button className="w-full" size="lg" variant={editingTerm ? 'default' : 'default'} onClick={addTerm}>{editingTerm ? 'Update Set' : 'Add Set'}</Button></div>
+                        <div className="md:col-span-2"><Button className="w-full" size="lg" variant="primary" onClick={addTerm}>{editingTerm ? 'Update Set' : 'Add Set'}</Button></div>
                     </div>
                 </div>
             </div>
@@ -682,16 +735,17 @@ function RulesView({ config, refresh }) {
     const addRule = async () => {
         const payload = {};
         antecedents.forEach(a => { if (a.var && a.term) payload[a.var] = a.term; });
-        if (!consequent.var || !consequent.term) return;
-        await fetch("/rule", {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ antecedents: payload, consequent: { [consequent.var]: consequent.term } })
-        });
+        if (Object.keys(payload).length === 0) return alert("Select at least one IF condition.");
+        if (!consequent.var || !consequent.term) return alert("Select the THEN variable and fuzzy set.");
+        await attempt(() => api("/rule", {
+            method: "POST",
+            body: { antecedents: payload, consequent: { [consequent.var]: consequent.term } }
+        }));
         refresh();
     };
 
     const deleteRule = async (i) => {
-        await fetch(`/rule/${i}`, { method: "DELETE" }); refresh();
+        await attempt(() => api(`/rule/${i}`, { method: "DELETE" })); refresh();
     };
 
     const inputs = Object.keys(config.variables).filter(v => config.variables[v].role === 'input');
@@ -727,7 +781,7 @@ function RulesView({ config, refresh }) {
                             <div className="flex-1 max-w-sm">
                                 <Select value={ant.term} disabled={!ant.var} onChange={e => { const c = [...antecedents]; c[i].term = e.target.value; setAntecedents(c); }}>
                                     <option value="">Select Fuzzy Set...</option>
-                                    {ant.var && Object.keys(config.variables[ant.var].terms).map(t => <option key={t} value={t}>{t}</option>)}
+                                    {ant.var && Object.keys(config.variables[ant.var]?.terms || {}).map(t => <option key={t} value={t}>{t}</option>)}
                                 </Select>
                             </div>
 
@@ -761,7 +815,7 @@ function RulesView({ config, refresh }) {
                     <div className="flex-1 max-w-sm">
                         <Select value={consequent.term} disabled={!consequent.var} onChange={e => setConsequent(p => ({ ...p, term: e.target.value }))}>
                             <option value="">Select Target Set...</option>
-                            {consequent.var && Object.keys(config.variables[consequent.var].terms).map(t => <option key={t} value={t}>{t}</option>)}
+                            {consequent.var && Object.keys(config.variables[consequent.var]?.terms || {}).map(t => <option key={t} value={t}>{t}</option>)}
                         </Select>
                     </div>
                     <div className="w-9"></div>
@@ -814,7 +868,7 @@ function RulesView({ config, refresh }) {
                                     </td>
                                 </tr>
                             ))}
-                            {config.rules.length === 0 && <tr><td colSpan="2" className="px-6 py-12 text-center text-zinc-400 font-medium italic">No rules defined in system.</td></tr>}
+                            {config.rules.length === 0 && <tr><td colSpan="3" className="px-6 py-12 text-center text-zinc-400 font-medium italic">No rules defined in system.</td></tr>}
                         </tbody>
                     </table>
                 </div>
@@ -835,39 +889,40 @@ function SimulateView({ config, refresh }) {
 
     const build = async () => {
         setStatus("building"); setError(null);
-        try { const res = await fetch("/build", { method: "POST" }); if (!res.ok) throw await res.json(); setStatus("ready"); }
-        catch (e) { setError(e.detail); setStatus("idle"); }
+        try { await api("/build", { method: "POST" }); setStatus("ready"); }
+        catch (e) { setError(e.message); setStatus("idle"); }
     };
 
+    // Loading a preset replaces the FIS; the server rebuilds it on the next simulation
     const loadPreset = async () => {
         if (scenario === "custom") return;
-        setLoadingPreset(true);
+        setLoadingPreset(true); setError(null);
         try {
-            await fetch(`/preset/${scenario}`, { method: "POST" });
+            await api(`/preset/${enc(scenario)}`, { method: "POST" });
             await refresh();
-            alert(`FIS configured for ${scenario} scenario.`);
+            setStatus("ready");
+        } catch (e) {
+            setError(e.message);
         } finally {
             setLoadingPreset(false);
         }
     };
 
-    if (status === "idle") {
-        return (
-            <div className="flex h-full items-center justify-center p-8 bg-zinc-50">
-                <div className="text-center p-12 bg-white border border-zinc-200 rounded-3xl shadow-xl max-w-md">
-                    <div className="w-20 h-20 bg-puc-red/10 rounded-full flex items-center justify-center mx-auto mb-8 text-puc-red border border-puc-red/20 shadow-inner">
-                        <div className="scale-150"><Icons.Power /></div>
-                    </div>
-                    <h2 className="text-2xl font-black text-zinc-900 mb-3 tracking-tight">System Idle</h2>
-                    <p className="text-zinc-500 text-sm mb-8 font-medium leading-relaxed">Engage the control engine and select a physics scenario to begin real-time fuzzy inference.</p>
-                    <div className="flex flex-col gap-3">
-                        <Button size="lg" variant="primary" onClick={build} icon={Icons.Power}>Initialize Engine</Button>
-                    </div>
-                    {error && <div className="mt-6 p-3 bg-rose-50 border border-rose-100 rounded-lg text-rose-500 text-[11px] font-bold uppercase tracking-wider">{error}</div>}
+    const idlePanel = (
+        <div className="flex h-full items-center justify-center p-8 bg-zinc-50">
+            <div className="text-center p-12 bg-white border border-zinc-200 rounded-3xl shadow-xl max-w-md">
+                <div className="w-20 h-20 bg-puc-red/10 rounded-full flex items-center justify-center mx-auto mb-8 text-puc-red border border-puc-red/20 shadow-inner">
+                    <div className="scale-150"><Icons.Power /></div>
                 </div>
+                <h2 className="text-2xl font-black text-zinc-900 mb-3 tracking-tight">System Idle</h2>
+                <p className="text-zinc-500 text-sm mb-8 font-medium leading-relaxed">Engage the control engine with your current FIS, or pick a scenario on the left and load its preset FIS.</p>
+                <div className="flex flex-col gap-3">
+                    <Button size="lg" variant="primary" onClick={build} icon={Icons.Power} disabled={status === "building"}>Initialize Engine</Button>
+                </div>
+                {error && <div className="mt-6 p-3 bg-rose-50 border border-rose-100 rounded-lg text-rose-500 text-[11px] font-bold">{error}</div>}
             </div>
-        );
-    }
+        </div>
+    );
 
     const scenarios = [
         { id: 'custom', label: 'Custom FIS Tester', group: 'General' },
@@ -909,19 +964,27 @@ function SimulateView({ config, refresh }) {
                     </div>
                 )}
 
-                <div className="mt-auto pt-4 border-t border-zinc-100">
-                    <Button variant="ghost" size="sm" className="w-full" onClick={() => setStatus('idle')}>Disconnect Engine</Button>
-                </div>
+                {scenario !== "custom" && error && status === "ready" && (
+                    <div className="p-3 bg-rose-50 border border-rose-100 rounded-lg text-rose-500 text-[10px] font-bold">{error}</div>
+                )}
+
+                {status === "ready" && (
+                    <div className="mt-auto pt-4 border-t border-zinc-100">
+                        <Button variant="ghost" size="sm" className="w-full" onClick={() => setStatus('idle')}>Disconnect Engine</Button>
+                    </div>
+                )}
             </aside>
 
             <main className="flex-1 min-w-0 bg-puc-stone/20 relative overflow-y-auto">
-                {scenario === 'custom' && <CustomSimulation config={config} />}
-                {scenario === 'dc_motor' && <DCMotorSimulation config={config} />}
-                {(scenario === 'tank' || scenario === 'tank_broken') && <TankSimulation config={config} />}
-                {scenario === 'crane' && <CraneSimulation config={config} />}
-                {scenario === 'robot_linear' && <RobotLinearSim config={config} />}
-                {scenario === 'robot_angular' && <RobotAngularSim config={config} />}
-                {scenario === 'robot_nav' && <RobotNavSim config={config} />}
+                {status !== "ready" ? idlePanel : <>
+                    {scenario === 'custom' && <CustomSimulation config={config} />}
+                    {scenario === 'dc_motor' && <DCMotorSimulation config={config} />}
+                    {(scenario === 'tank' || scenario === 'tank_broken') && <TankSimulation config={config} />}
+                    {scenario === 'crane' && <CraneSimulation config={config} />}
+                    {scenario === 'robot_linear' && <RobotLinearSim config={config} />}
+                    {scenario === 'robot_angular' && <RobotAngularSim config={config} />}
+                    {scenario === 'robot_nav' && <RobotNavSim config={config} />}
+                </>}
             </main>
         </div>
     );
@@ -929,7 +992,7 @@ function SimulateView({ config, refresh }) {
 
 // --- Simulation Step Inspector ---
 function StepInspector({ data }) {
-    if (!data) return null;
+    if (!data || !data.aggregated_output_shape) return null;
     
     // Process rule chart data
     const chartData = data.aggregated_output_shape.x.map((x, i) => {
@@ -943,6 +1006,11 @@ function StepInspector({ data }) {
     return (
         <div className="bg-white p-6 rounded-3xl shadow-xl border border-zinc-100 flex flex-col gap-6 w-full mt-8">
             <h3 className="text-[10px] font-black text-puc-gray uppercase tracking-widest">Inference Inspector</h3>
+            {data.no_rule_fired && (
+                <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-700 text-xs font-bold">
+                    No rule fired for these inputs, so the output is undefined. Add rules or widen the fuzzy sets that cover this region.
+                </div>
+            )}
             
             {/* Fuzzification */}
             <div>
@@ -1004,7 +1072,7 @@ function StepInspector({ data }) {
                                     stroke={COLORS[i % COLORS.length]} fill={COLORS[i % COLORS.length]} fillOpacity={0.2} strokeWidth={2} isAnimationActive={false} />
                             ))}
                             <Area type="linear" dataKey="aggregated" stroke="#1e293b" strokeWidth={3} fill="none" isAnimationActive={false} />
-                            <ReferenceLine x={data.output} stroke="#8C3A22" strokeWidth={2} strokeDasharray="4 4" label={{ position: 'top', value: `Centroid = ${data.output.toFixed(3)}`, fill: '#8C3A22', fontSize: 11, fontWeight: 'bold' }} />
+                            {data.output != null && <ReferenceLine x={data.output} stroke="#8C3A22" strokeWidth={2} strokeDasharray="4 4" label={{ position: 'top', value: `Centroid = ${data.output.toFixed(3)}`, fill: '#8C3A22', fontSize: 11, fontWeight: 'bold' }} />}
                         </AreaChart>
                     </ResponsiveContainer>
                 </div>
@@ -1034,24 +1102,22 @@ function DCMotorSimulation({ config }) {
         physicsRef.current.prevRpm = physicsRef.current.rpm;
 
         try {
-            const res = await fetch("/simulate", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ inputs: { error: error, error_dot: errorDot } })
-            });
-            if (!res.ok) return;
-            const data = await res.json();
-            const voltage = data.output || 0;
+            const data = await simulateFIS({ error: error, error_dot: errorDot });
+            const voltage = data.output ?? 0;
             physicsRef.current.voltage = Math.max(-12, Math.min(12, voltage));
-            
+
             setState(s => ({
-                ...s, 
-                rpm: physicsRef.current.rpm, 
+                ...s,
+                rpm: physicsRef.current.rpm,
                 voltage: physicsRef.current.voltage,
                 history: [...s.history.slice(-150), { t: Date.now(), rpm: physicsRef.current.rpm, sp: s.setpoint }],
-                inspectData: data
+                inspectData: data,
+                error: null
             }));
-        } catch (e) { }
+        } catch (e) {
+            physicsRef.current.voltage = 0;
+            setState(s => ({ ...s, error: e.message }));
+        }
     };
 
     useEffect(() => {
@@ -1120,6 +1186,7 @@ function DCMotorSimulation({ config }) {
 
     return (
         <div className="h-full flex flex-col items-center p-8 gap-8 overflow-y-auto custom-scrollbar">
+            <SimError message={state.error} />
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 w-full max-w-6xl shrink-0">
                 <div className="flex flex-col items-center bg-white p-8 rounded-3xl shadow-xl border border-zinc-100">
                     <h3 className="text-[10px] font-black text-puc-gray uppercase tracking-widest mb-4">DC Motor Dynamics</h3>
@@ -1171,15 +1238,10 @@ function CustomSimulation({ config }) {
     const simulate = async () => {
         setError(null);
         try {
-            const res = await fetch("/simulate", {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ inputs })
-            });
-            if (!res.ok) { const d = await res.json(); throw new Error(d.detail); }
-            const data = await res.json();
+            const data = await simulateFIS(inputs);
             setOutput(data.output);
             setInspectData(data);
-        } catch (e) { setError(e.message); }
+        } catch (e) { setError(e.message); setInspectData(null); }
     };
 
     if (inputVars.length === 0) {
@@ -1218,13 +1280,13 @@ function CustomSimulation({ config }) {
                     <Button variant="primary" size="lg" className="w-full" onClick={simulate}>Run Inference</Button>
                 </div>
             </div>
-            {output !== null && (
+            {inspectData && (
                 <div className="w-full max-w-4xl flex flex-col gap-6">
                     <div className="bg-white p-8 rounded-3xl shadow-xl border border-zinc-100">
                         <h3 className="text-[10px] font-black text-puc-gray uppercase tracking-widest mb-4">
                             Output: {outputVar ? outputVar[0] : 'Result'}
                         </h3>
-                        <p className="text-5xl font-black text-puc-red">{output.toFixed(4)}</p>
+                        <p className="text-5xl font-black text-puc-red">{output != null ? output.toFixed(4) : "—"}</p>
                     </div>
                     <StepInspector data={inspectData} />
                 </div>
@@ -1252,22 +1314,22 @@ function TankSimulation({ config }) {
 
     const syncFIS = async () => {
         const { level, prevLevel, valvePos } = physicsRef.current;
-        const levelErr = state.setpoint - level;
+        // Same convention as the sltank rules: "low" means the water is below the setpoint
+        const levelErr = level - state.setpoint;
         const rate = level - prevLevel;
         try {
-            const res = await fetch("/simulate", {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ inputs: { "level": levelErr, "rate": rate } })
-            });
-            const data = await res.json();
-            const valveRate = data.output || 0;
+            const data = await simulateFIS({ "level": levelErr, "rate": rate });
+            const valveRate = data.output ?? 0;
             physicsRef.current.valvePos = Math.max(0, Math.min(1, valvePos + valveRate * 0.1));
             setState(s => ({
                 ...s, level: physicsRef.current.level, valvePos: physicsRef.current.valvePos,
                 history: [...s.history.slice(-150), { t: Date.now(), level: physicsRef.current.level, sp: s.setpoint }],
-                inspectData: data
+                inspectData: data,
+                error: null
             }));
-        } catch (e) { }
+        } catch (e) {
+            setState(s => ({ ...s, error: e.message }));
+        }
     };
 
     useEffect(() => {
@@ -1314,6 +1376,7 @@ function TankSimulation({ config }) {
 
     return (
         <div className="h-full flex flex-col items-center p-8 gap-8 overflow-y-auto custom-scrollbar">
+            <SimError message={state.error} />
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 w-full max-w-6xl shrink-0">
                 <div className="flex flex-col items-center bg-white p-8 rounded-3xl shadow-xl border border-zinc-100">
                     <h3 className="text-[10px] font-black text-puc-gray uppercase tracking-widest mb-4">Water Tank — sltank Model</h3>
@@ -1356,10 +1419,11 @@ function CraneSimulation({ config }) {
         const dt = 0.01;
         const M = 2.0, m = 0.5, L = 2.0, g = 9.81, b = 0.1;
         const { x, v, theta, omega, force } = physicsRef.current;
+        // Hanging load, theta measured from straight down (positive = load to the right of the trolley)
         const sin_t = Math.sin(theta), cos_t = Math.cos(theta);
-        const denom = M + m - m * cos_t * cos_t;
-        const x_acc = (force + m * L * omega * omega * sin_t - m * g * sin_t * cos_t - b * v) / denom;
-        const theta_acc = (g * sin_t * (M + m) - cos_t * (force + m * L * omega * omega * sin_t) - b * v * cos_t) / (L * denom);
+        const denom = M + m * sin_t * sin_t;
+        const x_acc = (force - b * v + m * L * omega * omega * sin_t + m * g * sin_t * cos_t) / denom;
+        const theta_acc = -(x_acc * cos_t + g * sin_t) / L;
         physicsRef.current.v += x_acc * dt;
         physicsRef.current.x += physicsRef.current.v * dt;
         physicsRef.current.omega += theta_acc * dt;
@@ -1369,17 +1433,17 @@ function CraneSimulation({ config }) {
     const syncFIS = async () => {
         const { x, v, theta, omega } = physicsRef.current;
         try {
-            const res = await fetch("/simulate", {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ inputs: { "PosErr": state.target - x, "Vel": v, "Angle": theta, "W": omega } })
-            });
-            const data = await res.json();
-            physicsRef.current.force = data.output || 0;
+            const data = await simulateFIS({ "PosErr": state.target - x, "Vel": v, "Angle": theta, "W": omega });
+            physicsRef.current.force = data.output ?? 0;
             setState(s => ({
                 ...s, x: physicsRef.current.x, theta: physicsRef.current.theta,
-                history: [...s.history.slice(-150), { t: Date.now(), pos: x, angle: theta * 10 }]
+                history: [...s.history.slice(-150), { t: Date.now(), pos: x, angle: theta * 10 }],
+                error: null
             }));
-        } catch (e) { }
+        } catch (e) {
+            physicsRef.current.force = 0;
+            setState(s => ({ ...s, error: e.message }));
+        }
     };
 
     useEffect(() => {
@@ -1437,6 +1501,7 @@ function CraneSimulation({ config }) {
 
     return (
         <div className="h-full flex flex-col items-center justify-center p-6 gap-6">
+            <SimError message={state.error} />
             <div className="bg-white p-6 rounded-3xl shadow-xl border border-zinc-100 w-full max-w-4xl">
                 <h3 className="text-[10px] font-black text-puc-gray uppercase tracking-widest mb-4">Gantry Crane — Cart-Pendulum Dynamics</h3>
                 <canvas ref={canvasRef} width={700} height={320} className="w-full h-auto" />
@@ -1486,17 +1551,17 @@ function RobotLinearSim({ config }) {
         const distErr = state.target - pos;
         const rate = vel;
         try {
-            const res = await fetch("/simulate", {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ inputs: { "DistErr": distErr, "Rate": rate } })
-            });
-            const data = await res.json();
-            physicsRef.current.power = data.output || 0;
+            const data = await simulateFIS({ "DistErr": distErr, "Rate": rate });
+            physicsRef.current.power = data.output ?? 0;
             setState(s => ({
                 ...s, pos: physicsRef.current.pos, vel: physicsRef.current.vel,
-                history: [...s.history.slice(-150), { t: Date.now(), pos, vel, sp: s.target }]
+                history: [...s.history.slice(-150), { t: Date.now(), pos, vel, sp: s.target }],
+                error: null
             }));
-        } catch (e) { }
+        } catch (e) {
+            physicsRef.current.power = 0;
+            setState(s => ({ ...s, error: e.message }));
+        }
     };
 
     useEffect(() => {
@@ -1557,6 +1622,7 @@ function RobotLinearSim({ config }) {
 
     return (
         <div className="h-full flex flex-col items-center justify-center p-6 gap-6">
+            <SimError message={state.error} />
             <div className="bg-white p-6 rounded-3xl shadow-xl border border-zinc-100 w-full max-w-4xl">
                 <h3 className="text-[10px] font-black text-puc-gray uppercase tracking-widest mb-4">Robot — Linear Velocity Control</h3>
                 <canvas ref={canvasRef} width={700} height={160} className="w-full h-auto" />
@@ -1606,20 +1672,22 @@ function RobotAngularSim({ config }) {
     const syncFIS = async () => {
         const { omega } = physicsRef.current;
         const angErr = state.targetOmega - omega;
-        const prevOmega = state.omega;
+        // Previous sample lives in the ref: `state` here is the stale value captured when the interval was created
+        const prevOmega = physicsRef.current.prevOmega ?? omega;
+        physicsRef.current.prevOmega = omega;
         const angRate = omega - prevOmega;
         try {
-            const res = await fetch("/simulate", {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ inputs: { "AngErr": angErr, "AngRate": angRate } })
-            });
-            const data = await res.json();
-            physicsRef.current.steering = data.output || 0;
+            const data = await simulateFIS({ "AngErr": angErr, "AngRate": angRate });
+            physicsRef.current.steering = data.output ?? 0;
             setState(s => ({
                 ...s, omega: physicsRef.current.omega, theta: physicsRef.current.theta,
-                history: [...s.history.slice(-150), { t: Date.now(), omega, target: s.targetOmega }]
+                history: [...s.history.slice(-150), { t: Date.now(), omega, target: s.targetOmega }],
+                error: null
             }));
-        } catch (e) { }
+        } catch (e) {
+            physicsRef.current.steering = 0;
+            setState(s => ({ ...s, error: e.message }));
+        }
     };
 
     useEffect(() => {
@@ -1674,6 +1742,7 @@ function RobotAngularSim({ config }) {
 
     return (
         <div className="h-full flex flex-col items-center justify-center p-6 gap-6">
+            <SimError message={state.error} />
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full max-w-4xl">
                 <div className="bg-white p-6 rounded-3xl shadow-xl border border-zinc-100 flex flex-col items-center">
                     <h3 className="text-[10px] font-black text-puc-gray uppercase tracking-widest mb-4">Robot — Angular Velocity Control</h3>
@@ -1732,12 +1801,9 @@ function RobotNavSim({ config }) {
         const dDist = dist - prevDist;
         const dHead = headErr - prevHead;
         try {
-            const res = await fetch("/simulate", {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ inputs: { "DistErr": dist, "dDist": dDist, "HeadErr": headErr, "dHead": dHead } })
-            });
-            const data = await res.json();
-            const vel = (data.output || 0) * 3;
+            // DistErr's universe is [0, 10]; the far corner of the field is ~14 away
+            const data = await simulateFIS({ "DistErr": Math.min(dist, 10), "dDist": dDist, "HeadErr": headErr, "dHead": dHead });
+            const vel = (data.output ?? 0) * 3;
             physicsRef.current.v = vel;
             physicsRef.current.omega = headErr * 2.0;
             physicsRef.current.prevDist = dist;
@@ -1745,9 +1811,14 @@ function RobotNavSim({ config }) {
             setState(s => ({
                 ...s, x: physicsRef.current.x, y: physicsRef.current.y, theta: physicsRef.current.theta,
                 trail: [...s.trail.slice(-300), { x: physicsRef.current.x, y: physicsRef.current.y }],
-                history: [...s.history.slice(-150), { t: Date.now(), dist, headErr: headErr * (180 / Math.PI) }]
+                history: [...s.history.slice(-150), { t: Date.now(), dist, headErr: headErr * (180 / Math.PI) }],
+                error: null
             }));
-        } catch (e) { }
+        } catch (e) {
+            physicsRef.current.v = 0;
+            physicsRef.current.omega = 0;
+            setState(s => ({ ...s, error: e.message }));
+        }
     };
 
     useEffect(() => {
@@ -1823,6 +1894,7 @@ function RobotNavSim({ config }) {
 
     return (
         <div className="h-full flex flex-col items-center justify-center p-6 gap-6">
+            <SimError message={state.error} />
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 w-full max-w-5xl">
                 <div className="bg-white p-6 rounded-3xl shadow-xl border border-zinc-100">
                     <h3 className="text-[10px] font-black text-puc-gray uppercase tracking-widest mb-2">Robot Navigation — Click to Set Target</h3>
